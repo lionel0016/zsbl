@@ -13,31 +13,24 @@ _start:
 	li	t0, 0x70013
 	csrw	CSR_MCOR, t0
 
-	/* disable l0btb to workround auipc bug */
-	li	t0, 0x1ff
+	li	t0, 0x11ff
 	csrw	CSR_MHCR, t0
 
 	li	t0, 0xe0410009
 	csrw	CSR_MCCR2, t0
 
-	li	t0, 0xe6e30c
-	csrw	CSR_MHINT, t0
-
-	csrr	t0, CSR_MHINT2
-	li	t1, 3
-	slli	t1, t1, 7
-	or	t0, t0, t1
-	csrw	CSR_MHINT2, t0
-
-	li	t0, 0x638000
-	csrw	CSR_MXSTATUS, t0
-
-	/* disable dvm */
-	li	t0, 0x20
-	csrw	CSR_MHINT4, t0
-
 	li	t0, 1
 	csrw	CSR_MSMPR, t0
+
+	// enable fence.i fence sfence.vma broadcast
+	li	t0, 0x6e30c
+	csrw	CSR_MHINT, t0
+
+	// enable  THEADISAEE 	- bit 22
+	// enable MAEE 		- bit 21
+	// enable  CLINTEE 	- bit 17
+	li	t0, 0x638000
+	csrw	CSR_MXSTATUS, t0
 
 	/* delegate 0-7 exceptions to S-mode */
 	csrr	t0, CSR_MEDELEG
