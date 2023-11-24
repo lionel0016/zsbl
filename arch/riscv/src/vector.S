@@ -23,7 +23,7 @@ _start:
 	csrw	CSR_MSMPR, t0
 
 	// enable fence.i fence sfence.vma broadcast
-	li	t0, 0x6e30c
+	li	t0, 0x11ea32c
 	csrw	CSR_MHINT, t0
 
 	// enable  THEADISAEE 	- bit 22
