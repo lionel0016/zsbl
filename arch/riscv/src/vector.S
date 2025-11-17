@@ -55,24 +55,20 @@ _start:
 	add     sp,  zero, zero
 
 _try_lottery:
-#if 0
-	la	a0, smp_boot_spin_lock
-	li	t1, 1
-	amoadd.w	a0, t1, (a0)
-#else
 	csrr	a0, CSR_MHARTID
-#endif
-	bnez	a0, _wait_relocate_copy_done
 
+	bnez	a0, _secondary_park;
+
+#ifdef CONFIG_SUPPORT_PIC
 	/* Save load address */
 	lla	t0, _load_start
-	lla	t1, _fw_start
+	lla	t1, __ld_program_start
 	REG_S	t1, 0(t0)
 
 	/* relocate the global table content */
 	lla	t0, _link_start
 	REG_L	t0, 0(t0)
-	/* t1 shall has the address of _fw_start */
+	/* t1 shall has the address of __ld_program_start */
 	sub	t2, t1, t0
 	lla	t3, _runtime_offset
 	REG_S	t2, (t3)
@@ -126,6 +122,8 @@ _try_lottery:
 	j	_relocate_done
 
 _relocate_done:
+#endif
+
 	/* Setup trap handler */
 	la	a4, _trap_handler
 	csrw	CSR_MTVEC, a4
@@ -149,12 +147,16 @@ _end:
 poll_core:
 	amoswap.w.rl	x0, x0, (a0)
 
-not_support_smp:
+_secondary_park:
 #ifndef CONFIG_SUPPORT_SMP
 	wfi
-	beqz	zero, not_support_smp
+	beqz	zero, _secondary_park
 #else
+	/* Setup trap handler */
+	la	a4, _trap_handler
+	csrw	CSR_MTVEC, a4
 
+#ifdef CONFIG_SUPPORT_PIC
 _wait_relocate_copy_done:
 	li	t0, BOOT_STATUS_BOOT_HART_DONE
 	lla	t1, _boot_status
@@ -164,10 +166,7 @@ _wait_relocate_copy_done:
 	nop
 	nop
 	bne	t0, t1, _wait_relocate_copy_done
-
-	/* Setup trap handler */
-	la	a4, _trap_handler
-	csrw	CSR_MTVEC, a4
+#endif
 
 #ifdef CONFIG_SUPPORT_SMP
 	la	t0, smp_context
@@ -234,7 +233,6 @@ _trap_handler:
 	/* Re-use current SP as exception stack */
 	add	sp, sp, -(TRAP_REGS_SIZE)
 
-_trap_handler_all_mode:
 	/* Save T0 on stack */
 	REG_S	t0, TRAP_REGS_OFFSET(t0)(sp)
 
@@ -242,15 +240,11 @@ _trap_handler_all_mode:
 	/* Save original SP (from T0) on stack */
 	REG_S	t0, TRAP_REGS_OFFSET(sp)(sp)
 
-	/* Swap TP and MSCRATCH */
-	csrrw	tp, CSR_MSCRATCH, tp
-
 	/* Save MEPC and MSTATUS CSRs */
 	csrr	t0, CSR_MEPC
 	REG_S	t0, TRAP_REGS_OFFSET(mepc)(sp)
 	csrr	t0, CSR_MSTATUS
 	REG_S	t0, TRAP_REGS_OFFSET(mstatus)(sp)
-	REG_S	zero, TRAP_REGS_OFFSET(mstatusH)(sp)
 
 	/* Save all general regisers except SP and T0 */
 	REG_S	zero, TRAP_REGS_OFFSET(zero)(sp)
@@ -284,9 +278,16 @@ _trap_handler_all_mode:
 	REG_S	t5, TRAP_REGS_OFFSET(t5)(sp)
 	REG_S	t6, TRAP_REGS_OFFSET(t6)(sp)
 
-	/* Call C routine */
+	/* Prepare parameter of trap_handler */
 	add	a0, sp, zero
+	/* Move from thread stack to trap stack */
+	la	sp, trap_stack
+	li	t0, TRAP_STACK_SIZE
+	add	sp, sp, t0
+	/* Call C routine */
 	call	trap_handler
+	/* Load next thread stack */
+	add	sp, a0, zero
 
 	/* Restore all general regisers except SP and T0 */
 	REG_L	ra, TRAP_REGS_OFFSET(ra)(sp)
@@ -324,15 +325,6 @@ _trap_handler_all_mode:
 	csrw	CSR_MEPC, t0
 	REG_L	t0, TRAP_REGS_OFFSET(mstatus)(sp)
 	csrw	CSR_MSTATUS, t0
-#if __riscv_xlen == 32
-	csrr	t0, CSR_MISA
-	srli	t0, t0, ('H' - 'A')
-	andi	t0, t0, 0x1
-	beq	t0, zero, _skip_mstatush_restore
-	REG_L	t0, TRAP_REGS_OFFSET(mstatusH)(sp)
-	csrw	CSR_MSTATUSH, t0
-_skip_mstatush_restore:
-#endif
 
 	/* Restore T0 */
 	REG_L	t0, TRAP_REGS_OFFSET(t0)(sp)
@@ -350,7 +342,7 @@ smp_boot_spin_lock:
 main_boot_core:
 	.dword 0
 _load_start:
-	RISCV_PTR	_fw_start
+	RISCV_PTR	__ld_program_start
 _link_start:
 	RISCV_PTR	CONFIG_RAM_START
 _runtime_offset:

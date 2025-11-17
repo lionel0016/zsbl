@@ -1,9 +1,10 @@
-#include <framework/common.h>
+#include <common/common.h>
 #include <platform.h>
 #include <memmap.h>
 #include <asm.h>
 #include <lib/mmio.h>
 #include <lib/mac.h>
+#include <lib/cli.h>
 #include <driver/bootdev.h>
 #include <driver/mtd.h>
 #include <sbi.h>
@@ -12,13 +13,16 @@
 
 #include <libfdt.h>
 #include <of.h>
+#include <driver/dtb.h>
+#include <stdint.h>
 
 #include "config.h"
 
-#define OPENSBI_ADDR		0x00000000
-#define KERNEL_ADDR		0x02000000
-#define DEVICETREE_ADDR		0x20000000
-#define RAMFS_ADDR		0x30000000
+#define OPENSBI_ADDR			0x00000000
+#define KERNEL_ADDR			0x02000000
+#define DEVICETREE_ADDR			0x20000000
+#define DEVICETREE_OVERLAY_ADDR		0x28000000
+#define RAMFS_ADDR			0x30000000
 
 
 static void print_core_ctrlreg(void)
@@ -87,11 +91,85 @@ static void boot_next_img(struct config *cfg)
 
 int parse_config_file(struct config *cfg);
 
+static void load_dtbs(struct config *cfg)
+{
+	int err;
+	void *dtbi;
+	void *dtb = (void *)cfg->dtb.addr;
+	void *dtbo = (void *)cfg->dtbo.addr;
+	uint32_t dtb_size;
+	uint32_t dtbo_size;
+
+	if (cfg->dtb.name)
+		dtbi = (void *)cfg->dtb.addr;
+	else
+		dtbi = dtb_get_base();
+
+	dtb_size = fdt_totalsize(dtbi);
+	dtbo_size = cfg->dtbo.name ? fdt_totalsize(dtbo) : 0;
+
+	err = fdt_open_into(dtbi, dtb, ROUND_UP(dtb_size + dtbo_size + (16 * 1024), 8));
+	if (err)
+		pr_err("Failed to move core dtb to the destination\n");
+
+}
+
+static void merge_dtbs(struct config *cfg)
+{
+	int err;
+	void *dtbo = (void *)cfg->dtbo.addr;
+	void *dtb = (void *)cfg->dtb.addr;
+
+	if (!dtbo || !cfg->dtbo.name || !cfg->dtbo.name[0])
+		return;
+
+	err = fdt_overlay_apply(dtb, dtbo);
+	if (err)
+		pr_err("Overlay core dtb and extended dtb failed with error code %d\n", err);
+}
+
+/* check if a file is a device tree overlay or not, by file extension */
+static int file_is_dtbo(const char *name)
+{
+	int namelen, extlen;
+	const char *ext = ".dtbo";
+
+	if (!name)
+		return false;
+
+	namelen = strlen(name);
+	extlen = strlen(ext);
+
+	if (namelen < strlen(ext))
+		return false;
+
+	return strcmp(&name[namelen - extlen], ext) == 0;
+}
+
+
 static void load_images(struct config *cfg)
 {
+	if (cfg->dtb.name) {
+		/* if dtb is specified in config.ini, then don't load and overlay dtbo */
+		if (file_is_dtbo(cfg->dtb.name)) {
+			/* check if dtbo is set */
+			if (cfg->dtbo.name) {
+				/* we cannot set two dtbo at the same time */
+				pr_debug("We cannot set two dtbo at the same time\n");
+				pr_debug("Ignore dtbo specified by devicetree-overlay command\n");
+			}
+			cfg->dtbo.name = cfg->dtb.name;
+			cfg->dtb.name = NULL;
+
+		} else {
+			cfg->dtbo.name = NULL;
+		}
+	}
+
 	load(&cfg->sbi);
 	load(&cfg->kernel);
 	load(&cfg->dtb);
+	load(&cfg->dtbo);
 	load(&cfg->ramfs);
 }
 
@@ -140,12 +218,23 @@ static void config_init(struct config *cfg)
 {
 	cfg->sbi.name = "fw_dynamic.bin";
 	cfg->sbi.addr = OPENSBI_ADDR;
-	cfg->dtb.name = "mango-sophgo-x8evb.dtb";
+	cfg->dtb.name = NULL;
 	cfg->dtb.addr = DEVICETREE_ADDR;
+
+#ifdef USE_LINUX_BOOT
+	cfg->dtbo.name = NULL;
+	cfg->dtbo.addr = 0;
 	cfg->kernel.name = "riscv64_Image";
-	cfg->kernel.addr = KERNEL_ADDR;
 	cfg->ramfs.name = "initrd.img";
 	cfg->ramfs.addr = RAMFS_ADDR;
+#else
+	cfg->dtbo.name = "mango-sophgo-pisces.dtbo";
+	cfg->dtbo.addr = DEVICETREE_OVERLAY_ADDR;
+	cfg->kernel.name = "SRA1-20.fd";
+	cfg->ramfs.name = NULL;
+	cfg->ramfs.addr = RAMFS_ADDR;
+#endif
+	cfg->kernel.addr = KERNEL_ADDR;
 }
 
 uint64_t get_ddr_size(uint64_t ddr_reg_size, int ddr_channel)
@@ -188,6 +277,13 @@ const char *dtb_names[] = {
 	"mango-sophgo-x4evb.dtb",
 };
 
+const char *kernel_names[] = {
+	"SG2042-EVB.fd",
+	"MilkV-Pioneer.fd",
+	"SRA1-20.fd",
+	"SG2042-EVB.fd",
+};
+
 static void build_board_info(struct config *cfg)
 {
 	int i;
@@ -202,10 +298,14 @@ static void build_board_info(struct config *cfg)
 
 	cfg->board_type = mmio_read_32(BOARD_TYPE_REG);
 
-	if (cfg->board_type >= BOARD_TYPE_MIN && cfg->board_type <= BOARD_TYPE_MAX)
+	if (cfg->board_type >= BOARD_TYPE_MIN && cfg->board_type <= BOARD_TYPE_MAX) {
 		cfg->dtb.name = (char *)dtb_names[cfg->board_type - BOARD_TYPE_MIN];
-	else
+#ifndef USE_LINUX_BOOT
+		cfg->kernel.name = (char *)kernel_names[cfg->board_type - BOARD_TYPE_MIN];
+#endif
+	} else {
 		pr_err("Can not find device tree\n");
+	}
 
 	for (i = 0; i < MAX_CHIP_NUM; ++i)
 		cfg->ddr[i][0].base = CHIP_ADDR_SPACE * i;
@@ -227,19 +327,11 @@ int resize_dtb(struct config *cfg, int delta)
 	fdt = (void *)cfg->dtb.addr;
 	size = fdt_totalsize(fdt) + delta;
 
-	fdt = realloc(fdt, size);
-	if (fdt) {
-		ret = fdt_open_into(fdt, fdt, size);
-		if (ret != 0)
-			pr_err("fdt: resize failed, error[%d\n]", ret);
-		else {
-			cfg->dtb.addr = (uint64_t)fdt;
-			cfg->dtb.size = size;
-		}
-	} else {
-		pr_err("fdt: realloc fdt failed\n");
-		ret = -1;
-	}
+	ret = fdt_open_into(fdt, fdt, size);
+	if (ret != 0)
+		pr_err("fdt: resize failed, error[%d\n]", ret);
+	else
+		cfg->dtb.size = size;
 
 	return ret;
 }
@@ -449,13 +541,11 @@ static void modify_eth_node(struct config *cfg)
 
 static void modify_dtb(struct config *cfg)
 {
-	int ret = 0;
+	load_dtbs(cfg);
+	merge_dtbs(cfg);
 
-	ret = resize_dtb(cfg, 4096);
-	if (!ret) {
-		modify_ddr_node(cfg);
-		modify_bootargs(cfg);
-	}
+	modify_ddr_node(cfg);
+	modify_bootargs(cfg);
 
 	modify_cpu_node(cfg);
 	modify_eth_node(cfg);
@@ -490,6 +580,9 @@ int plat_main(void)
 
 	parse_config_file(&cfg);
 	show_config(&cfg);
+
+	cli_loop(100000);
+
 	load_images(&cfg);
 
 	modify_dtb(&cfg);

@@ -2,8 +2,9 @@
 #include <stdlib.h>
 #include <arch.h>
 
-#include <framework/module.h>
-#include <framework/common.h>
+#include <common/module.h>
+#include <common/common.h>
+#include <lib/cli.h>
 
 extern unsigned long __ld_test_case_start[0], __ld_test_case_end[0];
 
@@ -38,6 +39,8 @@ int main(void)
 	run_test("testcase",
 		 (module_init_func *)__ld_test_case_start,
 		 (module_init_func *)__ld_test_case_end);
+
+	cli_loop(0);
 
 	return 0;
 }

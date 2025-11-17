@@ -4,7 +4,10 @@
 #include <stdio.h>
 #include <timer.h>
 
-#include <framework/common.h>
+#include <common/common.h>
+#include <common/thread.h>
+
+unsigned char __attribute__((aligned(16))) trap_stack[TRAP_STACK_SIZE];
 
 static void trap_error(ulong exception_code, struct trap_regs *regs)
 {
@@ -98,16 +101,22 @@ static void unknown_isr(void)
 	printf("Unknown Interrupt Happen\n");
 }
 
+static void (*(isr_table[]))(void) = {
+	[1] = sswi_isr,
+	[3] = mswi_isr,
+	[5] = stimer_isr,
+	[7] = mtimer_isr,
+	[9] = sei_isr,
+	[11] = mei_isr,
+};
+
+void arch_install_external_interrupt_handler(void (*exti_handler))
+{
+	isr_table[11] = exti_handler;
+}
+
 static void trap_interrupt(ulong exception_code, struct trap_regs *regs)
 {
-	const void (*(isr_table[]))(void) = {
-		[1] = sswi_isr,
-		[3] = mswi_isr,
-		[5] = stimer_isr,
-		[7] = mtimer_isr,
-		[9] = sei_isr,
-		[11] = mei_isr,
-	};
 	void (*isr)(void);
 
 	if (exception_code < ARRAY_SIZE(isr_table))
@@ -121,7 +130,35 @@ static void trap_interrupt(ulong exception_code, struct trap_regs *regs)
 		unknown_isr();
 }
 
-void trap_handler(struct trap_regs *regs)
+#ifdef CONFIG_MULTI_THREAD
+#include <arch_thread.h>
+struct trap_regs *trap_handler(struct trap_regs *regs)
+{
+	struct arch_cpu_ctx ctx;
+
+	ulong mcause = csr_read(CSR_MCAUSE);
+	ulong is_interrupt = mcause & (1UL << 63);
+	ulong exception_code = mcause & ~(1UL << 63);
+
+
+	/*
+	 * filter out machine call
+	 * ecall exception is synchronous, it means error pc is the address where
+	 * causes this exception, we need multiple of 4 (size of ecall instruction)
+	 */
+	if (is_interrupt)
+		trap_interrupt(exception_code, regs);
+	else if (exception_code != 11)
+		trap_error(exception_code, regs);
+	else
+		regs->mepc += 4;
+
+	ctx.regs = regs;
+
+	return sched_thread(&ctx)->regs;
+}
+#else
+struct trap_regs *trap_handler(struct trap_regs *regs)
 {
 	ulong mcause = csr_read(CSR_MCAUSE);
 	ulong is_interrupt = mcause & (1UL << 63);
@@ -131,5 +168,8 @@ void trap_handler(struct trap_regs *regs)
 		trap_interrupt(exception_code, regs);
 	else
 		trap_error(exception_code, regs);
+
+	return regs;
 }
+#endif
 

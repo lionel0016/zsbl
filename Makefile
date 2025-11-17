@@ -664,6 +664,8 @@ DEBUG_CFLAGS	+= -DDEBUG
 endif
 
 KBUILD_CFLAGS += $(DEBUG_CFLAGS)
+KBUILD_AFLAGS += $(DEBUG_CFLAGS)
+KBUILD_LDFLAGS += $(DEBUG_CFLAGS)
 export DEBUG_CFLAGS
 
 # always gc sections
@@ -919,7 +921,7 @@ include $(dtstree)/Makefile
 %.dtb: %.dts
 	@echo "  DC      $@"
 	$(Q)mkdir -p $(dir $@)
-	$(Q)dtc -@ -I dts -O dtb -o $@ $^
+	$(Q)dtc -@ -I dts -O dtb -o $@ $^ -q
 
 dtb-real-y = $(foreach dtb, $(dtb-y), $(objtree)/$(dtstree)/$(dtb))
 

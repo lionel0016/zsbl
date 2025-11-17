@@ -1,7 +1,13 @@
 
-menu "IRQ Chips"
-source "drivers/irqchip/gic/Kconfig"
+config DRIVER_INTERRUPT
+	bool "Support Interrupt"
+	default n
+	help
+	Support interrupt.
+
+if DRIVER_INTERRUPT
 source "drivers/irqchip/ictl/Kconfig"
 source "drivers/irqchip/intc/Kconfig"
-endmenu
-
+source "drivers/irqchip/plic/Kconfig"
+source "drivers/irqchip/mtli/Kconfig"
+endif
