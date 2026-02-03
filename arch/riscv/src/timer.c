@@ -7,6 +7,7 @@
 #include <timer.h>
 
 #include <common/module.h>
+#include <common/common.h>
 #include <driver/platform.h>
 
 uint64_t timer_frequency(void)
@@ -86,10 +87,6 @@ void timer_init(void)
 /* timer late init, enable timer interrupts */
 /* assume hart id is contigurous */
 
-#define CLINT_NAME		"clint"
-#define ACLINT_NAME		"aclint-mtimer"
-#define CLINT_MTIMECMP_OFFSET	0x4000
-
 #ifdef CONFIG_SMP
 #define ISR_NUM	CONFIG_SMP_NUM
 static uint64_t get_isr_index(void)
@@ -104,9 +101,17 @@ static uint64_t get_isr_index(void)
 }
 #endif
 
+enum {
+	TIMER_TYPE_CLINT,
+	TIMER_TYPE_ACLINT,
+	TIMER_TYPE_SSTC
+};
+
+#define CLINT_MTIMECMP_OFFSET	0x4000
+
 struct timer_ctx {
 	struct {
-		char *type;
+		int type;
 		void *base;
 	} mtimecmp;
 
@@ -121,20 +126,40 @@ struct timer_ctx {
 /* arch timer always global */
 static struct timer_ctx *ctx;
 
+static void setup_next_time(void *reg, uint64_t next)
+{
+	if (reg) {
+		writel(next >> 32, reg + 4);
+		writel(next & 0xffffffff, reg);
+	} else {
+		csr_write(CSR_STIMECMP, next);
+	}
+}
+
 void mtimer_isr(void)
 {
 	uint64_t idx = get_isr_index();
+	uint64_t next;
+
+	next = timer_get_tick() + ctx->isr[idx].tick;
+
+	setup_next_time(ctx->isr[idx].mtimecmp, next);
 
 	if (!ctx->isr[idx].func)
 		return;
 
 	ctx->isr[idx].func(ctx->isr[idx].data);
-	writeq(timer_get_tick() + ctx->isr[idx].tick, ctx->isr[idx].mtimecmp);
+}
+
+void stimer_isr(void)
+{
+	mtimer_isr();
 }
 
 int timer_enable_irq(uint64_t tick, void (*isr)(void *data), void *data)
 {
 	uint64_t idx = get_isr_index();
+	uint64_t next;
 
 	if (!ctx)
 		return -ENODEV;
@@ -142,12 +167,20 @@ int timer_enable_irq(uint64_t tick, void (*isr)(void *data), void *data)
 	ctx->isr[idx].tick = tick;
 	ctx->isr[idx].func = isr;
 	ctx->isr[idx].data = data;
-	ctx->isr[idx].mtimecmp = ctx->mtimecmp.base + idx * 8;
+	if (ctx->mtimecmp.type == TIMER_TYPE_SSTC)
+		ctx->isr[idx].mtimecmp = 0;
+	else
+		ctx->isr[idx].mtimecmp = ctx->mtimecmp.base + idx * 8;
 
-	writeq(timer_get_tick() + tick, ctx->isr[idx].mtimecmp);
+	next = timer_get_tick() + tick;
+
+	setup_next_time(ctx->isr[idx].mtimecmp, next);
 
 	/* enable timer interrupt */
-	arch_enable_local_timer_irq();
+	if (ctx->mtimecmp.type == TIMER_TYPE_SSTC)
+		arch_enable_local_stimer_irq();
+	else
+		arch_enable_local_timer_irq();
 
 	return 0;
 }
@@ -157,18 +190,28 @@ int timer_disable_irq(void)
 	if (!ctx)
 		return -ENODEV;
 
-	arch_disable_local_timer_irq();
+	if (ctx->mtimecmp.type == TIMER_TYPE_SSTC)
+		arch_disable_local_stimer_irq();
+	else
+		arch_disable_local_timer_irq();
 
 	return 0;
 }
 
 static int timer_probe(struct platform_device *pdev)
 {
-	int is_aclint = false;
+	int timer_type;
 
 	if (pdev->match->data)
-		if (strcmp(pdev->match->data, ACLINT_NAME) == 0)
-			is_aclint = true;
+		timer_type = *(int *)(pdev->match->data);
+	else
+		timer_type = TIMER_TYPE_CLINT;
+
+	if (timer_type == TIMER_TYPE_SSTC) {
+		csr_set(CSR_MENVCFG, MENVCFG_STCE);
+		if ((csr_read(CSR_MENVCFG) & MENVCFG_STCE) == 0)
+			return -ENODEV;
+	}
 
 	ctx = malloc(sizeof(struct timer_ctx));
 	if (!ctx)
@@ -176,30 +219,48 @@ static int timer_probe(struct platform_device *pdev)
 
 	memset(ctx, 0, sizeof(struct timer_ctx));
 
-	if (is_aclint) {
-		ctx->mtimecmp.type = ACLINT_NAME;
-		ctx->mtimecmp.base = (void *)pdev->reg_base;
-	} else {
-		ctx->mtimecmp.type = CLINT_NAME;
+	ctx->mtimecmp.type = timer_type;
+
+	switch (timer_type) {
+	case TIMER_TYPE_CLINT:
 		ctx->mtimecmp.base = (void *)pdev->reg_base + CLINT_MTIMECMP_OFFSET;
+		break;
+	case TIMER_TYPE_ACLINT:
+		ctx->mtimecmp.base = (void *)pdev->reg_base;
+		break;
+	default: /* sstc */
+		break;
 	}
 
-	/* enable global interrupt, MSTATUS.MIE */
-	arch_enable_local_irq();
 	/* disable timer interrupt on reset */
-	arch_disable_local_timer_irq();
+	if (timer_type == TIMER_TYPE_SSTC)
+		arch_disable_local_stimer_irq();
+	else
+		arch_disable_local_timer_irq();
 
 	return 0;
 }
 
+static const int timer_type_clint = TIMER_TYPE_CLINT;
+static const int timer_type_aclint = TIMER_TYPE_ACLINT;
+static const int timer_type_sstc = TIMER_TYPE_SSTC;
+
 static struct of_device_id match_table[] = {
 	{
 		.compatible = "riscv,clint0",
-		.data = (void *)CLINT_NAME,
+		.data = &timer_type_clint,
+	},
+	{
+		.compatible = "thead,c900-clint-mtimer",
+		.data = &timer_type_clint,
 	},
 	{
 		.compatible = "thead,c900-aclint-mtimer",
-		.data = (void *)ACLINT_NAME,
+		.data = &timer_type_aclint,
+	},
+	{
+		.compatible = "sstc",
+		.data = &timer_type_sstc,
 	},
 	{},
 };
